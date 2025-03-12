@@ -6,7 +6,7 @@
 #include "hash_functions.h"
 
 #define KEEP 16 // only the first 16 bytes of a hash are kept
-
+// Test edit
 struct cracked_hash {
 	char hash[2*KEEP+1];
 	char *password, *alg;
