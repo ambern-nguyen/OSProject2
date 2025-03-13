@@ -83,7 +83,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     char password[256];  // assume candidate passwords are at most 255 characters
     char hex_hash[2 * KEEP + 1];
 
-    /* --- Load hashed passwords --- */
+  
     int n_hashed = 0;
     struct cracked_hash *cracked_hashes;
     fp = fopen(hashed_list, "r");
@@ -101,7 +101,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     }
     fclose(fp);
 
-    /* --- Load candidate passwords into an array --- */
+  
     int n_candidates = 0;
     fp = fopen(password_list, "r");
     assert(fp != NULL);
@@ -116,17 +116,17 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     }
     fclose(fp);
 
-    /* --- Initialize per-hash mutexes --- */
+  
     pthread_mutex_t *mutexes = malloc(n_hashed * sizeof(pthread_mutex_t));
     for (int i = 0; i < n_hashed; i++) {
         pthread_mutex_init(&mutexes[i], NULL);
     }
 
-    /* --- Setup shared counter for dynamic scheduling --- */
+ 
     int *next_candidate = malloc(sizeof(int));
     *next_candidate = 0;
 
-    /* --- Create threads --- */
+
     int n_threads = 6; // Adjust thread count as desired.
     pthread_t threads[n_threads];
     thread_arg targs[n_threads];
@@ -143,7 +143,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
         pthread_join(threads[i], NULL);
     }
 
-    /* --- Write results to output file --- */
+
     fp = fopen(output, "w");
     assert(fp != NULL);
     for (int i = 0; i < n_hashed; i++) {
@@ -154,7 +154,6 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     }
     fclose(fp);
 
-    /* --- Clean up --- */
     for (int i = 0; i < n_hashed; i++) {
         pthread_mutex_destroy(&mutexes[i]);
         free(cracked_hashes[i].password);
