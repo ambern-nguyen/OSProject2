@@ -6,163 +6,252 @@
 #include <limits.h>
 #include "hash_functions.h"
 
-#define KEEP 16 // only the first 16 bytes of a hash are kept
+#define HASH_BYTES 16  // Only the first 16 bytes of a hash are kept
 
-// Structure for storing each hashed password.
-struct cracked_hash {
-    char hash[2 * KEEP + 1];
-    char *password;
-    char *alg;
-    int candidate_index;  // lower index means an earlier candidate
+
+// Structure for storing each found or not ofund password.
+struct found_password {
+    char target_hash[2 * HASH_BYTES + 1];
+    char *password;       // Matching candidate password (if found)
+    char *algorithm;      // Which hash algorithm produced the match
+    int candidate_index;  // Lower index means an earlier candidate (better match)
 };
 
-typedef unsigned char *(*hashing)(unsigned char *, unsigned int);
+// Define a type for the hash functions (they return a binary hash).
+typedef unsigned char *(*hashing_function)(unsigned char *, unsigned int);
 
-int n_algs = 4;
-hashing fn[4] = { calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512 };
-char *algs[4] = { "MD5", "SHA1", "SHA256", "SHA512" };
 
-// Compare two hexadecimal hash strings; returns 1 if identical.
-int compare_hashes(char *a, char *b) {
-    for (int i = 0; i < 2 * KEEP; i++) {
-        if (a[i] != b[i])
+// Global list of hash functions and their names.
+int num_algorithms = 4;
+hashing_function hash_funcs[4] = { calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512 };
+char *algorithm_names[4] = { "MD5", "SHA1", "SHA256", "SHA512" };
+
+//Compare two hexadecimal hash strings; returns 1 if they are identical
+static inline int are_hashes_equal(const char *hash1, const char *hash2) {
+    for (int i = 0; i < 2 * HASH_BYTES; i++) {
+        if (hash1[i] != hash2[i])
             return 0;
     }
     return 1;
 }
 
-// Thread argument structure using a shared counter (pointer to int)
-typedef struct {
-    int n_candidates;            // total number of candidate passwords
-    int n_hashed;                // number of hashed entries
-    char **candidates;           // candidate password array
-    struct cracked_hash *cracked_hashes; // array of hashed passwords
-    pthread_mutex_t *mutexes;    // one mutex per cracked_hash entry
-    int *next_candidate;         // pointer to a shared counter for dynamic scheduling
-} thread_arg;
 
-// Modified thread function using dynamic scheduling with __sync_fetch_and_add.
-void *thread_crack(void *arg) {
-    thread_arg *targ = (thread_arg *) arg;
-    int i;
-    while (1) {
-        // Atomically fetch and increment the shared counter.
-        i = __sync_fetch_and_add(targ->next_candidate, 1);
-        if (i >= targ->n_candidates)
-            break;
-        char *password = targ->candidates[i];
-        // For each algorithm, compute the hash and compare against each stored hash.
-        for (int k = 0; k < n_algs; k++) {
-            unsigned char *hash = fn[k]((unsigned char *)password, strlen(password));
-            char hex_hash[2 * KEEP + 1];
-            for (int j = 0; j < KEEP; j++)
-                sprintf(&hex_hash[2 * j], "%02x", hash[j]);
-            hex_hash[2 * KEEP] = '\0';
-            free(hash);
-            for (int j = 0; j < targ->n_hashed; j++) {
-                if (compare_hashes(hex_hash, targ->cracked_hashes[j].hash)) {
-                    pthread_mutex_lock(&targ->mutexes[j]);
-                    if (targ->cracked_hashes[j].password == NULL ||
-                        i < targ->cracked_hashes[j].candidate_index) {
-                        if (targ->cracked_hashes[j].password != NULL)
-                            free(targ->cracked_hashes[j].password);
-                        targ->cracked_hashes[j].password = strdup(password);
-                        targ->cracked_hashes[j].alg = algs[k];
-                        targ->cracked_hashes[j].candidate_index = i;
+//Simple password map (hash map) implementation
+struct password_map_entry {
+    char key[2 * HASH_BYTES + 1];  // The target hash as a hex string
+    int found_index;               // Index into the found_password array
+    struct password_map_entry *next; // Pointer for handling collisions (chaining)
+};
+
+// djb2 hash function (converts a string into an unsigned long hash).
+unsigned long djb2_hash(const char *str) {
+    unsigned long hash = 5381;
+    int character;
+    while ((character = *str++))
+        hash = ((hash << 5) + hash) + character; // hash * 33 + character
+    return hash;
+}
+
+
+// Structure to pass parameters to each thread.
+typedef struct {
+    int num_candidates;                   // Total number of candidate passwords
+    int num_target_hashes;                // Total number of hashed passwords
+    char **candidate_passwords;           // Array of candidate password strings
+    struct found_password *found_list;    // Array of target hash entries to update
+    pthread_mutex_t *entry_mutexes;       // One mutex per found password entry
+
+    // Static partitioning parameters:
+    int thread_id;                        // This thread's ID 
+    int total_threads;                    // Total number of worker threads
+
+    // Parameters for the password map (hash map):
+    struct password_map_entry **password_map; // Array of map buckets
+    int map_size;                         // Number of buckets in the map
+} thread_args;
+
+
+// The result is stored in the provided 'hex_string' buffer.
+static inline void convert_to_hex(const unsigned char *binary, char *hex_string) {
+    static const char hex_digits[] = "0123456789abcdef";
+    for (int i = 0; i < HASH_BYTES; i++) {
+        hex_string[2 * i]     = hex_digits[binary[i] >> 4];
+        hex_string[2 * i + 1] = hex_digits[binary[i] & 0x0f];
+    }
+    hex_string[2 * HASH_BYTES] = '\0';
+}
+
+
+// Each thread works on every total_threads-th candidate based on its thread_id.
+void *process_candidates(void *arg) {
+    thread_args *args = (thread_args *) arg;
+    int totalCandidates = args->num_candidates;
+    int myId = args->thread_id;
+
+    // Loop over candidate passwords assigned to this thread.
+    for (int candidateIndex = myId; candidateIndex < totalCandidates; candidateIndex += args->total_threads) {
+        char *currentPassword = args->candidate_passwords[candidateIndex];
+        int passwordLength = (int)strlen(currentPassword); // Cache the password length
+
+        // Try each available hash algorithm.
+        for (int algo = 0; algo < num_algorithms; algo++) {
+            // Compute the binary hash for the current candidate.
+            unsigned char *binaryHash = hash_funcs[algo]((unsigned char *)currentPassword, passwordLength);
+            char computedHex[2 * HASH_BYTES + 1];
+            convert_to_hex(binaryHash, computedHex);
+            free(binaryHash);
+
+            // Look up the computed hash in our password map.
+            unsigned long hashValue = djb2_hash(computedHex);
+            int bucketIndex = hashValue % args->map_size;
+            struct password_map_entry *entry = args->password_map[bucketIndex];
+
+            // Check all entries in this bucket (handle collisions).
+            while (entry) {
+                if (strcmp(entry->key, computedHex) == 0) {
+                    int foundIdx = entry->found_index;
+                    // Lock the specific found password entry before updating.
+                    pthread_mutex_lock(&args->entry_mutexes[foundIdx]);
+                    // Update the entry if no match has been recorded or if this candidate comes earlier.
+                    if (args->found_list[foundIdx].password == NULL ||
+                        candidateIndex < args->found_list[foundIdx].candidate_index) {
+                        if (args->found_list[foundIdx].password) {
+                            free(args->found_list[foundIdx].password);
+                        }
+                        args->found_list[foundIdx].password = strdup(currentPassword);
+                        args->found_list[foundIdx].algorithm = algorithm_names[algo];
+                        args->found_list[foundIdx].candidate_index = candidateIndex;
                     }
-                    pthread_mutex_unlock(&targ->mutexes[j]);
+                    pthread_mutex_unlock(&args->entry_mutexes[foundIdx]);
                 }
+                entry = entry->next;
             }
         }
     }
     return NULL;
 }
 
-void crack_hashed_passwords(char *password_list, char *hashed_list, char *output) {
-    FILE *fp;
-    char password[256];  // assume candidate passwords are at most 255 characters
-    char hex_hash[2 * KEEP + 1];
 
-  
-    int n_hashed = 0;
-    struct cracked_hash *cracked_hashes;
-    fp = fopen(hashed_list, "r");
-    assert(fp != NULL);
-    while (fscanf(fp, "%s", hex_hash) == 1)
-        n_hashed++;
-    rewind(fp);
-    cracked_hashes = malloc(n_hashed * sizeof(struct cracked_hash));
-    assert(cracked_hashes != NULL);
-    for (int i = 0; i < n_hashed; i++) {
-        fscanf(fp, "%s", cracked_hashes[i].hash);
-        cracked_hashes[i].password = NULL;
-        cracked_hashes[i].alg = NULL;
-        cracked_hashes[i].candidate_index = INT_MAX; // not yet cracked
+// Main function that reads input files, spawns threads to process candidate passwords, and writes the results to the output file
+void crack_hashed_passwords(char *candidate_file, char *hashed_file, char *output_file) {
+    FILE *file;
+    char tempBuffer[256];  // Temporary buffer for reading candidate passwords
+    char tempHash[2 * HASH_BYTES + 1];
+
+   
+    int totalTargetHashes = 0;
+    struct found_password *foundPasswords;
+
+    file = fopen(hashed_file, "r");
+    assert(file != NULL);
+    // Count how many hashed passwords we have.
+    while (fscanf(file, "%s", tempHash) == 1)
+        totalTargetHashes++;
+    rewind(file);
+
+    // Allocate array for the found passwords.
+    foundPasswords = malloc(totalTargetHashes * sizeof(struct found_password));
+    assert(foundPasswords != NULL);
+    for (int i = 0; i < totalTargetHashes; i++) {
+        fscanf(file, "%s", foundPasswords[i].target_hash);
+        foundPasswords[i].password = NULL;
+        foundPasswords[i].algorithm = NULL;
+        foundPasswords[i].candidate_index = INT_MAX;
     }
-    fclose(fp);
+    fclose(file);
 
-  
-    int n_candidates = 0;
-    fp = fopen(password_list, "r");
-    assert(fp != NULL);
-    while (fscanf(fp, "%s", password) == 1)
-        n_candidates++;
-    rewind(fp);
-    char **candidates = malloc(n_candidates * sizeof(char *));
-    assert(candidates != NULL);
-    int idx = 0;
-    while (fscanf(fp, "%s", password) == 1) {
-        candidates[idx++] = strdup(password);
+   
+    // Set map size to 2*totalTargetHashes + 1 for a low load factor
+    int mapSize = 2 * totalTargetHashes + 1;
+    struct password_map_entry **passwordMap = malloc(mapSize * sizeof(struct password_map_entry *));
+    assert(passwordMap != NULL);
+    for (int i = 0; i < mapSize; i++)
+        passwordMap[i] = NULL;
+
+    // Insert each target hash into the map
+    for (int i = 0; i < totalTargetHashes; i++) {
+        struct password_map_entry *newEntry = malloc(sizeof(struct password_map_entry));
+        assert(newEntry != NULL);
+        strcpy(newEntry->key, foundPasswords[i].target_hash);
+        newEntry->found_index = i;
+        unsigned long keyHash = djb2_hash(newEntry->key);
+        int bucket = keyHash % mapSize;
+        newEntry->next = passwordMap[bucket];
+        passwordMap[bucket] = newEntry;
     }
-    fclose(fp);
 
-  
-    pthread_mutex_t *mutexes = malloc(n_hashed * sizeof(pthread_mutex_t));
-    for (int i = 0; i < n_hashed; i++) {
+    //Read Candidate Passwords 
+    int totalCandidates = 0;
+    file = fopen(candidate_file, "r");
+    assert(file != NULL);
+    while (fscanf(file, "%s", tempBuffer) == 1)
+        totalCandidates++;
+    rewind(file);
+
+    char **candidatePasswords = malloc(totalCandidates * sizeof(char *));
+    assert(candidatePasswords != NULL);
+    int candidateIndex = 0;
+    while (fscanf(file, "%s", tempBuffer) == 1) {
+        candidatePasswords[candidateIndex++] = strdup(tempBuffer);
+    }
+    fclose(file);
+
+    //Initialize Mutexes 
+    pthread_mutex_t *mutexes = malloc(totalTargetHashes * sizeof(pthread_mutex_t));
+    for (int i = 0; i < totalTargetHashes; i++) {
         pthread_mutex_init(&mutexes[i], NULL);
     }
 
- 
-    int *next_candidate = malloc(sizeof(int));
-    *next_candidate = 0;
-
-
-    int n_threads = 6; // Adjust thread count as desired.
-    pthread_t threads[n_threads];
-    thread_arg targs[n_threads];
-    for (int i = 0; i < n_threads; i++) {
-        targs[i].n_candidates = n_candidates;
-        targs[i].n_hashed = n_hashed;
-        targs[i].candidates = candidates;
-        targs[i].cracked_hashes = cracked_hashes;
-        targs[i].mutexes = mutexes;
-        targs[i].next_candidate = next_candidate;
-        pthread_create(&threads[i], NULL, thread_crack, &targs[i]);
+    
+    // We use static partitioning. 
+    int totalThreads = 6;  // Adjust this based on available CPU cores.
+    pthread_t threads[totalThreads];
+    thread_args threadParameters[totalThreads];
+    for (int i = 0; i < totalThreads; i++) {
+        threadParameters[i].num_candidates = totalCandidates;
+        threadParameters[i].num_target_hashes = totalTargetHashes;
+        threadParameters[i].candidate_passwords = candidatePasswords;
+        threadParameters[i].found_list = foundPasswords;
+        threadParameters[i].entry_mutexes = mutexes;
+        threadParameters[i].thread_id = i;
+        threadParameters[i].total_threads = totalThreads;
+        threadParameters[i].password_map = passwordMap;
+        threadParameters[i].map_size = mapSize;
+        pthread_create(&threads[i], NULL, process_candidates, &threadParameters[i]);
     }
-    for (int i = 0; i < n_threads; i++) {
+    for (int i = 0; i < totalThreads; i++) {
         pthread_join(threads[i], NULL);
     }
 
-
-    fp = fopen(output, "w");
-    assert(fp != NULL);
-    for (int i = 0; i < n_hashed; i++) {
-        if (cracked_hashes[i].password == NULL)
-            fprintf(fp, "not found\n");
+    //Write the Output
+    file = fopen(output_file, "w");
+    assert(file != NULL);
+    for (int i = 0; i < totalTargetHashes; i++) {
+        if (foundPasswords[i].password == NULL)
+            fprintf(file, "not found\n");
         else
-            fprintf(fp, "%s:%s\n", cracked_hashes[i].password, cracked_hashes[i].alg);
+            fprintf(file, "%s:%s\n", foundPasswords[i].password, foundPasswords[i].algorithm);
     }
-    fclose(fp);
+    fclose(file);
 
-    for (int i = 0; i < n_hashed; i++) {
+    //Cleanup Memory 
+    for (int i = 0; i < totalTargetHashes; i++) {
         pthread_mutex_destroy(&mutexes[i]);
-        free(cracked_hashes[i].password);
+        free(foundPasswords[i].password);
     }
     free(mutexes);
-    free(cracked_hashes);
-    for (int i = 0; i < n_candidates; i++) {
-        free(candidates[i]);
+    free(foundPasswords);
+    for (int i = 0; i < totalCandidates; i++) {
+        free(candidatePasswords[i]);
     }
-    free(candidates);
-    free(next_candidate);
+    free(candidatePasswords);
+    for (int i = 0; i < mapSize; i++) {
+        struct password_map_entry *entry = passwordMap[i];
+        while (entry) {
+            struct password_map_entry *nextEntry = entry->next;
+            free(entry);
+            entry = nextEntry;
+        }
+    }
+    free(passwordMap);
 }
